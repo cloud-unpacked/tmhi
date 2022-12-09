@@ -1,0 +1,193 @@
+version: 2.1
+
+orbs:
+  gor: hubci/goreleaser@1.0
+  osd: circleci/os-detect@0.3.0
+
+executors:
+  linux-docker:
+    docker:
+      - image: cimg/base:2022.11
+  linux-amd64:
+    machine:
+      image: ubuntu-2204:2022.10.2
+  linux-arm64:
+    machine:
+      image: ubuntu-2004:2022.10.1
+    resource_class: arm.medium
+  macos:
+    macos:
+      xcode: 13.0.0
+  windows:
+    machine:
+      image: windows-server-2022-gui:2022.10.1
+      resource_class: windows.medium
+
+workflows:
+  main:
+    jobs:
+      - test
+      - gor/release:
+          version: "1.13.1"
+          go-version: "1.19.4"
+          dry-run: true
+          post-steps:
+            - persist_to_workspace:
+                root: "."
+                paths:
+                  - "dist"
+      - test-with-images:
+          requires:
+            - gor/release
+          matrix:
+            parameters:
+              image:
+                - linux-docker
+                - linux-amd64
+                - linux-arm64
+                - macos
+      - test-with-windows:
+          requires:
+            - gor/release
+      - functional-tests:
+          requires:
+            - gor/release
+  release:
+    jobs:
+      - test:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              # Simplified SemVer regex
+              only: /^v\d+\.\d+\.\d+$/
+      - gor/release:
+          version: "1.13.1"
+          go-version: "1.19.4"
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              # Simplified SemVer regex
+              only: /^v\d+\.\d+\.\d+$/
+          post-steps:
+            - persist_to_workspace:
+                root: "."
+                paths:
+                  - "dist"
+          context: main
+      - deb-publish:
+          requires:
+            - gor/release
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              # Simplified SemVer regex
+              only: /^v\d+\.\d+\.\d+$/
+
+jobs:
+  test:
+    docker:
+      - image: cimg/go:1.19.4
+    environment:
+      GOTESTSUM_JUNITFILE: "junit/unit-tests.xml"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - go-mod-v2-{{ checksum "go.sum" }}
+      - run:
+          name: "Download Dependancies"
+          command: cd tmhi && go mod download
+      - run:
+          name: "Run Tests & Coverage"
+          command: |
+            cd ./tmhi
+            mkdir junit
+            gotestsum -- -coverprofile=coverage.txt -covermode=atomic ./...
+            bash <(curl -s https://codecov.io/bash)
+      - store_test_results:
+          path: junit
+      - store_artifacts:
+          path: junit/unit-tests.xml
+      - run:
+          name: "Upload to Codecov"
+          command: cd tmhi && bash <(curl -s https://codecov.io/bash)
+      - save_cache:
+          key: go-mod-v2-{{ checksum "go.sum" }}
+          paths:
+            - "/home/circleci/.cache/go-build"
+  test-with-images:
+    parameters:
+      image:
+        type: executor
+    executor: <<parameters.image>>
+    steps:
+      - osd/init
+      - attach_workspace:
+          at: .
+      - run: |
+          V1=""
+
+          if uname -m | grep "x86_64"; then
+            V1="_v1"
+          fi
+
+          if [ $OSD_FAMILY == "linux" ]; then
+            ./dist/tmhi_linux_$(dpkg --print-architecture)${V1}/tmhi version
+          elif [ $OSD_FAMILY == "darwin" ]; then
+            ./dist/tmhi_darwin_amd64${V1}/tmhi version
+          else
+            echo "Unsupported OS and/or architecture when testing the TMHI binary." && exit 1
+          fi
+  test-with-windows:
+    executor: windows
+    steps:
+      - attach_workspace:
+          at: .
+      - run: |
+          ./dist/tmhi_windows_amd64_v1/tmhi version
+  functional-tests:
+    executor: linux-amd64
+    steps:
+      - attach_workspace:
+          at: .
+      - run: |
+          mv ./dist/tmhi_linux_amd64_v1/tmhi ~/bin/
+
+          echo "none yet"
+  deb-publish:
+    docker:
+      - image: cimg/base:2022.11
+    steps:
+      - attach_workspace:
+          at: .
+      - add_ssh_keys
+      - run: |
+          echo 'pkg.atl.revidian.net ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBE16slz1okRPeUhxIpzBCn9rHqjk51ylxEYlYXvblswcxOQ0rPyAX6N8Bd2pnsh99xce/jaX2KJHPLPCc+zAXTg= root@li361-16' >> ~/.ssh/known_hosts
+      - run: |
+          ssh pkg@pkg.atl.revidian.net "mkdir ~/incoming/tmhi-${CIRCLE_TAG}"
+          scp ./dist/*.deb pkg@pkg.atl.revidian.net:incoming/tmhi-${CIRCLE_TAG}/
+
+          # Ubuntu 20.04 Focal
+          ssh pkg@pkg.atl.revidian.net "aptly repo add ftech-ubuntu-focal ~/incoming/tmhi-${CIRCLE_TAG}/"
+          ssh pkg@pkg.atl.revidian.net "aptly snapshot create ftech-ubuntu-focal--tmhi-${CIRCLE_TAG} from repo ftech-ubuntu-focal"
+          ssh pkg@pkg.atl.revidian.net "aptly publish switch focal filesystem:ftech:/ubuntu ftech-ubuntu-focal--tmhi-${CIRCLE_TAG}"
+
+          # Ubuntu 22.04 Jammy
+          ssh pkg@pkg.atl.revidian.net "aptly repo add ftech-ubuntu-jammy ~/incoming/tmhi-${CIRCLE_TAG}/"
+          ssh pkg@pkg.atl.revidian.net "aptly snapshot create ftech-ubuntu-jammy--tmhi-${CIRCLE_TAG} from repo ftech-ubuntu-jammy"
+          ssh pkg@pkg.atl.revidian.net "aptly publish switch jammy filesystem:ftech:/ubuntu ftech-ubuntu-jammy--tmhi-${CIRCLE_TAG}"
+
+          # Ubuntu 22.10 Kinetic
+          ssh pkg@pkg.atl.revidian.net "aptly repo add ftech-ubuntu-kinetic ~/incoming/tmhi-${CIRCLE_TAG}/"
+          ssh pkg@pkg.atl.revidian.net "aptly snapshot create ftech-ubuntu-kinetic--tmhi-${CIRCLE_TAG} from repo ftech-ubuntu-kinetic"
+          ssh pkg@pkg.atl.revidian.net "aptly publish switch kinetic filesystem:ftech:/ubuntu ftech-ubuntu-kinetic--tmhi-${CIRCLE_TAG}"
+
+          # Ubuntu Lunar
+          ssh pkg@pkg.atl.revidian.net "aptly repo add ftech-ubuntu-lunar ~/incoming/tmhi-${CIRCLE_TAG}/"
+          ssh pkg@pkg.atl.revidian.net "aptly snapshot create ftech-ubuntu-lunar--tmhi-${CIRCLE_TAG} from repo ftech-ubuntu-lunar"
+          ssh pkg@pkg.atl.revidian.net "aptly publish switch lunar filesystem:ftech:/ubuntu ftech-ubuntu-lunar--tmhi-${CIRCLE_TAG}"
+
+          ssh pkg@pkg.atl.revidian.net "rm -r ~/incoming/tmhi-${CIRCLE_TAG}"
