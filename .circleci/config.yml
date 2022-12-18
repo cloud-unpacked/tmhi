@@ -24,7 +24,7 @@ executors:
       resource_class: windows.medium
 
 workflows:
-  main:
+  main-wf:
     jobs:
       - test
       - gor/release:
@@ -52,7 +52,7 @@ workflows:
       - functional-tests:
           requires:
             - gor/release
-  release:
+  release-wf:
     jobs:
       - test:
           filters:
@@ -75,7 +75,7 @@ workflows:
                 root: "."
                 paths:
                   - "dist"
-          context: main
+          context: goreleaser-ctx
       - deb-publish:
           requires:
             - gor/release
